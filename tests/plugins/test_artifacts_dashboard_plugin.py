@@ -569,20 +569,24 @@ def test_projects_id_collision_returns_500(api):
 
 
 # ---------------------------------------------------------------------------
-# 15. process-home override — behavioral: ContextVar override 무시
+# 15. process-home override — behavioral: get_process_hermes_home() 호출 증명
 # ---------------------------------------------------------------------------
 
 def test_process_hermes_home_ignores_contextvar_override(monkeypatch, tmp_path):
-    """plugin_api._get_roots() must use get_process_hermes_home(), not get_hermes_home().
+    """plugin_api._get_roots() must call get_process_hermes_home(), not read env directly.
 
-    get_hermes_home() follows a request-scoped ContextVar override (set_hermes_home_override).
-    get_process_hermes_home() ignores that override and always reads the HERMES_HOME env var.
+    Proof by substitution:
+      - HERMES_HOME env var → req_home  (no file; a buggy plugin reading env gets this)
+      - mod.get_process_hermes_home monkeypatched → launch_home  (has the file)
 
-    The plugin must use get_process_hermes_home() so that its roots stay anchored to the
-    process-launch home even when a per-request profile override is active.
+    /items: if plugin calls get_process_hermes_home() → launch_home → real.png found.
+            if plugin reads HERMES_HOME directly      → req_home   → real.png missing → assertion fails.
+    /content: verifies the cached entry is served correctly.
+
+    Module-level name bindings are shared across threads, so monkeypatching
+    mod.get_process_hermes_home is visible inside the TestClient worker thread
+    without requiring ContextVar propagation across thread boundaries.
     """
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-
     # Launch home — contains the file we'll serve.
     launch_home = tmp_path / "launch"
     (launch_home / "task-staging").mkdir(parents=True)
@@ -591,41 +595,46 @@ def test_process_hermes_home_ignores_contextvar_override(monkeypatch, tmp_path):
     f = launch_home / "task-staging" / "real.png"
     f.write_bytes(b"\x89PNG\r\n\x1a\nRESULT")
 
-    # Request-scoped override — different home that does NOT contain the file.
+    # Request-scoped home — different, does NOT contain the file.
     req_home = tmp_path / "request"
     (req_home / "task-staging").mkdir(parents=True)
     (req_home / "reports").mkdir(parents=True)
     (req_home / "kanban" / "briefs").mkdir(parents=True)
 
-    # Load plugin module with launch_home as HERMES_HOME.
-    monkeypatch.setenv("HERMES_HOME", str(launch_home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
+    # Load the plugin module (this also sets HERMES_HOME=launch_home via monkeypatch).
     mod = _load_plugin_api(monkeypatch, launch_home)
 
     app = FastAPI()
     app.include_router(mod.router, prefix="/api/plugins/artifacts")
     client = TestClient(app, raise_server_exceptions=False)
 
-    # Populate the cache while launch_home is active.
+    # Now point HERMES_HOME to req_home (no file).
+    # A buggy plugin reading os.environ["HERMES_HOME"] directly would scan req_home.
+    monkeypatch.setenv("HERMES_HOME", str(req_home))
+
+    # Override get_process_hermes_home in the fresh module's namespace to return
+    # launch_home — simulating "process was launched under launch_home; env was
+    # later changed by a per-request profile override".
+    monkeypatch.setattr(mod, "get_process_hermes_home", lambda: launch_home)
+
+    # /items: plugin must call mod.get_process_hermes_home() → launch_home → real.png found.
     r = client.get("/api/plugins/artifacts/items")
     assert r.status_code == 200
     items = r.json()["items"]
     item = next((i for i in items if i["name"] == "real.png"), None)
-    assert item is not None, "real.png must appear in /items scan under launch_home"
+    assert item is not None, (
+        f"real.png must appear: plugin must call get_process_hermes_home() "
+        f"(→ launch_home). HERMES_HOME env now points to req_home (no file). "
+        f"Items: {[i['name'] for i in items]}"
+    )
     item_id = item["id"]
 
-    # Now set a request-scoped ContextVar override pointing to req_home.
-    # get_hermes_home() would follow this and serve from req_home (missing file → 404).
-    # get_process_hermes_home() ignores it and keeps serving from launch_home.
-    token = set_hermes_home_override(req_home)
-    try:
-        r2 = client.get(f"/api/plugins/artifacts/content/{item_id}")
-    finally:
-        reset_hermes_home_override(token)
-
+    # /content: cached entry references launch_home path — must return 200.
+    r2 = client.get(f"/api/plugins/artifacts/content/{item_id}")
     assert r2.status_code == 200, (
         f"Expected 200 — plugin must use get_process_hermes_home() (launch_home={launch_home}), "
-        f"not get_hermes_home() which would follow req_home={req_home}. "
+        f"not HERMES_HOME env (→ req_home={req_home}). "
         f"Got {r2.status_code}: {r2.text}"
     )
