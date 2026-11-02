@@ -29,7 +29,6 @@
   if (!SDK) return;
 
   var React      = SDK.React;
-  var ReactDOM   = SDK.ReactDOM;
   var authedFetch = SDK.authedFetch;
   var h = React.createElement;
 
@@ -110,14 +109,24 @@
     });
   }
 
-  // Requery a single item by id (for 404 cache-miss recovery; used by B2b).
+  // Requery an item by rel_path (for 404 cache-miss recovery; used by B2b).
+  // Searches the current filters to find the refreshed item with the same
+  // rel_path, then returns it (caller can retry /content/<new_id>).
   // Exposed on window.__HERMES_ARTIFACTS__ for the B2b content renderer.
-  function refetchItemById(id) {
-    var qs = new URLSearchParams({ id: id, limit: "1" });
+  function refetchItem(item, params) {
+    var p = params || {};
+    var qs = new URLSearchParams();
+    if (p.project && p.project !== "all") qs.set("project", p.project);
+    if (p.source  && p.source  !== "all") qs.set("source",  p.source);
+    if (p.kind    && p.kind    !== "all") qs.set("kind",    p.kind);
+    if (item.name) qs.set("q", item.name.slice(0, 100));
+    qs.set("limit", "20");
     return apiFetch("/items?" + qs.toString()).then(function (r) {
       if (!r.ok) return null;
       return r.json().then(function (data) {
-        return (data.items && data.items[0]) || null;
+        return (data.items || []).find(function (i) {
+          return i.rel_path === item.rel_path;
+        }) || null;
       });
     }).catch(function () { return null; });
   }
@@ -144,7 +153,7 @@
   if (typeof window !== "undefined") {
     window.__HERMES_ARTIFACTS__ = {
       apiFetch:      apiFetch,
-      refetchItemById: refetchItemById,
+      refetchItem:   refetchItem,
       triggerDownload: triggerDownload,
       timeAgo:       timeAgo,
       fmtSize:       fmtSize,
@@ -171,7 +180,7 @@
       var localUrl = null;
       apiFetch("/content/" + item.id)
         .then(function (r) {
-          if (!r.ok) throw new Error(r.status);
+          if (!r.ok) throw Object.assign(new Error(r.status), { status: r.status });
           return r.blob();
         })
         .then(function (blob) {
@@ -180,8 +189,27 @@
           imgSrcRef.current = localUrl;
           setBlobUrl(localUrl);
         })
-        .catch(function () {
-          if (mountedRef.current) setFailed(true);
+        .catch(function (err) {
+          if (!mountedRef.current) return;
+          // 404: 1회 재조회 — 서버 재시작 후 stale id 복구.
+          // 그 외 오류: 즉시 실패.
+          if (err.status !== 404) { setFailed(true); return; }
+          refetchItem(item).then(function (refreshed) {
+            if (!mountedRef.current) return;
+            // rel_path가 같은 새 항목을 못 찾거나 id가 동일하면 포기
+            if (!refreshed || refreshed.id === item.id) { setFailed(true); return; }
+            return apiFetch("/content/" + refreshed.id)
+              .then(function (r2) {
+                if (!r2.ok || !mountedRef.current) { setFailed(true); return; }
+                return r2.blob().then(function (blob) {
+                  if (!mountedRef.current) return;
+                  localUrl = URL.createObjectURL(blob);
+                  imgSrcRef.current = localUrl;
+                  setBlobUrl(localUrl);
+                });
+              })
+              .catch(function () { if (mountedRef.current) setFailed(true); });
+          }).catch(function () { if (mountedRef.current) setFailed(true); });
         });
       return function () {
         mountedRef.current = false;
@@ -867,48 +895,52 @@
             "aria-multiselectable": "true",
           },
             (function () {
+              var content = [];
               if (loadingItems && items.length === 0) {
-                return Array.from({ length: 6 }, function (_, i) {
+                content = Array.from({ length: 6 }, function (_, i) {
                   return h(SkeletonRow, { key: "sk" + i });
                 });
-              }
-              if (!loadingItems && items.length === 0) {
-                return [h("div", { key: "empty", className: "art-empty-list" },
+              } else if (!loadingItems && items.length === 0) {
+                content = [h("div", { key: "empty", className: "art-empty-list" },
                   h("span", { style: { fontSize: "32px", opacity: 0.3 } }, "🗂"),
                   h("p", { className: "art-empty-title" }, "산출물 없음")
                 )];
-              }
-              var rows = [];
-              var curGroup = undefined;
-              items.forEach(function (item) {
-                if (item.group != null && item.group !== curGroup) {
-                  curGroup = item.group;
-                  rows.push(h("div", { key: "g-" + curGroup, className: "art-group-header" }, curGroup));
+              } else {
+                var rows = [];
+                var curGroup = undefined;
+                items.forEach(function (item) {
+                  if (item.group != null && item.group !== curGroup) {
+                    curGroup = item.group;
+                    rows.push(h("div", { key: "g-" + curGroup, className: "art-group-header" }, curGroup));
+                  }
+                  var isSelected = !!(selectedItem && selectedItem.id === item.id);
+                  var isCompared = compareIds.indexOf(item.id) !== -1;
+                  rows.push(h(FileRow, {
+                    key: item.id,
+                    item: item,
+                    isSelected: isSelected,
+                    isCompared: isCompared,
+                    onSelect: handleSelect,
+                    onToggleCompare: handleToggleCompare,
+                  }));
+                });
+                if (truncated && count) {
+                  rows.push(h("div", { key: "trunc", className: "art-truncated-banner", role: "alert" },
+                    "⚠ " + count.toLocaleString() + "건 중 일부만 표시. 검색어를 구체화하세요."
+                  ));
                 }
-                var isSelected = !!(selectedItem && selectedItem.id === item.id);
-                var isCompared = compareIds.indexOf(item.id) !== -1;
-                rows.push(h(FileRow, {
-                  key: item.id,
-                  item: item,
-                  isSelected: isSelected,
-                  isCompared: isCompared,
-                  onSelect: handleSelect,
-                  onToggleCompare: handleToggleCompare,
-                }));
-              });
-              if (truncated && count) {
-                rows.push(h("div", { key: "trunc", className: "art-truncated-banner", role: "alert" },
-                  "⚠ " + count.toLocaleString() + "건 중 일부만 표시. 검색어를 구체화하세요."
-                ));
+                if (loadingMore) {
+                  rows.push(h("div", {
+                    key: "lm",
+                    style: { padding: "12px", textAlign: "center", color: "var(--art-fg-muted)", fontSize: "11px" },
+                  }, "불러오는 중…"));
+                }
+                content = rows;
               }
-              rows.push(h("div", { key: "sentinel", ref: sentinelRef, style: { height: "1px" } }));
-              if (loadingMore) {
-                rows.push(h("div", {
-                  key: "lm",
-                  style: { padding: "12px", textAlign: "center", color: "var(--art-fg-muted)", fontSize: "11px" },
-                }, "불러오는 중…"));
-              }
-              return rows;
+              // Sentinel은 항상 렌더링: IntersectionObserver가 초기(빈·스켈레톤)
+              // 상태부터 감시를 시작해야 cursor 페이징이 동작한다.
+              content.push(h("div", { key: "sentinel", ref: sentinelRef, style: { height: "1px" } }));
+              return content;
             })()
           )
         ),
@@ -937,14 +969,9 @@
     );
   }
 
-  // ── Mount ──────────────────────────────────────────────────────────────────
-  var root = document.getElementById("hermes-plugin-root");
-  if (!root) return;
-
-  if (ReactDOM.createRoot) {
-    ReactDOM.createRoot(root).render(h(ArtifactsApp, null));
-  } else {
-    ReactDOM.render(h(ArtifactsApp, null), root);
+  // ── Register with host plugin system ────────────────────────────────────────
+  if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
+    window.__HERMES_PLUGINS__.register("artifacts", ArtifactsApp);
   }
 
 })();
