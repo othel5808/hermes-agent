@@ -68,11 +68,76 @@
   }
 
   function isDownloadOnly(item) {
+    // B2b: svg는 이제 <img>로 미리보기 가능 → 목록 썸네일 ↓only 배지 제거
     var name = (item.name || "").toLowerCase();
     return (
-      name.endsWith(".svg") || name.endsWith(".html") || name.endsWith(".htm") ||
+      name.endsWith(".html") || name.endsWith(".htm") ||
       item.kind === "other"
     );
+  }
+
+  // ── B2b helpers ─────────────────────────────────────────────────────────────
+
+  function getExt(name) {
+    var idx = (name || "").lastIndexOf(".");
+    return idx >= 0 ? name.slice(idx + 1).toLowerCase() : "";
+  }
+
+  // classifyPreview — 확장자/kind 기반 렌더러 결정
+  function classifyPreview(item) {
+    var name = (item.name || "").toLowerCase();
+    var ext  = getExt(name);
+    var imgExts = ["png","jpg","jpeg","gif","webp","bmp","tiff","avif"];
+    if (imgExts.indexOf(ext) !== -1 || item.kind === "image") return "image";
+    if (ext === "svg")                          return "svg";
+    if (ext === "md" || ext === "markdown")     return "md";
+    var textExts = [
+      "txt","csv","log","json","yaml","yml","xml","ini","toml","conf",
+      "sh","bash","py","js","ts","tsx","jsx","mjs","cjs",
+      "rb","go","rs","c","cpp","h","java","kt","swift"
+    ];
+    if (textExts.indexOf(ext) !== -1)           return "text";
+    if (ext === "pdf")                          return "pdf";
+    return "no-preview"; // html/htm 및 그 외
+  }
+
+  /**
+   * makeSvgImgUrl — SVG 안전 렌더러 (Codex 리뷰 대상)
+   *
+   * 보안 제약 (절대 변경 금지):
+   *   1. rawBlob 을 반드시 'image/svg+xml' type 으로 새 Blob 재생성 후
+   *      URL.createObjectURL 만 사용한다.
+   *   2. 반환된 URL 은 오직 <img src> 에만 사용.
+   *      <object> / <iframe> / inline 삽입 / 새 탭 열기 / href 노출 금지.
+   *   3. unmount 시 URL.revokeObjectURL 필수 호출 (호출자 책임).
+   *   4. <img> 컨텍스트에서는 SVG 내 <script> 와 외부 리소스가 실행되지 않는다.
+   *      (브라우저 보안 모델 — 추가 CSP 없이도 적용됨)
+   */
+  function makeSvgImgUrl(rawBlob) {
+    var svgBlob = new Blob([rawBlob], { type: "image/svg+xml" });
+    return URL.createObjectURL(svgBlob);
+  }
+
+  // fetchContent — authedFetch + 404 1회 refetch 공통 패턴
+  // onSuccess(responseOrText), onError(err), asText=true 면 r.text() 반환
+  function fetchContent(item, asText, onSuccess, onError) {
+    var localUrl = null; // caller uses only for blob; text path ignores
+    function tryFetch(id, retry) {
+      apiFetch("/content/" + id)
+        .then(function (r) {
+          if (!r.ok) throw Object.assign(new Error(r.status), { status: r.status });
+          return asText ? r.text() : r.blob();
+        })
+        .then(onSuccess)
+        .catch(function (err) {
+          if (err.status !== 404 || retry) { onError(err); return; }
+          refetchItem(item).then(function (refreshed) {
+            if (!refreshed || refreshed.id === item.id) { onError(err); return; }
+            tryFetch(refreshed.id, true);
+          }).catch(function () { onError(err); });
+        });
+    }
+    tryFetch(item.id, false);
   }
 
   // ── API layer ──────────────────────────────────────────────────────────────
@@ -512,6 +577,253 @@
     );
   }
 
+  // ── B2b: Markdown parser ───────────────────────────────────────────────────
+  // 경량 라인 파싱 렌더러: 헤더·목록·코드블록·굵게·http(s) 링크만 지원.
+  // 표·이미지 미지원. innerHTML 미사용 — React textContent 처리로 XSS 안전.
+
+  function parseMd(text) {
+    var lines = text.split("\n");
+    var elements = [];
+    var i = 0;
+    var k = 0;
+    function key() { return "md" + (k++); }
+
+    function parseInline(s) {
+      var parts = [];
+      var re = /(\*\*([^*\n]+?)\*\*|`([^`\n]+?)`|(https?:\/\/[^\s<>"()]*[^\s<>"().,!?;:]))/g;
+      var last = 0, m, ki = 0;
+      while ((m = re.exec(s)) !== null) {
+        if (m.index > last) parts.push(s.slice(last, m.index));
+        if (m[2] !== undefined)      parts.push(h("strong", { key: "b"+ki++ }, m[2]));
+        else if (m[3] !== undefined) parts.push(h("code",   { key: "c"+ki++ }, m[3]));
+        else if (m[4] !== undefined) parts.push(h("a", { key: "a"+ki++, href: m[4], target: "_blank", rel: "noopener noreferrer" }, m[4]));
+        last = m.index + m[0].length;
+      }
+      if (last < s.length) parts.push(s.slice(last));
+      return parts;
+    }
+
+    while (i < lines.length) {
+      var line = lines[i];
+      // 코드블록
+      if (line.startsWith("```")) {
+        var lang = line.slice(3).trim();
+        var code = [];
+        i++;
+        while (i < lines.length && !lines[i].startsWith("```")) { code.push(lines[i]); i++; }
+        elements.push(h("pre", { key: key(), className: "art-md-pre" },
+          h("code", { className: lang ? "lang-"+lang : "" }, code.join("\n"))
+        ));
+        i++; continue;
+      }
+      // 헤더
+      var hm = line.match(/^(#{1,6})\s+(.*)/);
+      if (hm) {
+        var lvl = hm[1].length;
+        elements.push(h("h"+Math.min(lvl,6), { key: key(), className: "art-md-h"+lvl }, parseInline(hm[2])));
+        i++; continue;
+      }
+      // 순서없는 목록
+      if (/^[\-\*]\s+/.test(line)) {
+        var lis = [];
+        while (i < lines.length && /^[\-\*]\s+/.test(lines[i])) {
+          lis.push(h("li", { key: i }, parseInline(lines[i].replace(/^[\-\*]\s+/, ""))));
+          i++;
+        }
+        elements.push(h("ul", { key: key(), className: "art-md-ul" }, lis));
+        continue;
+      }
+      // 수평선
+      if (/^---+$/.test(line.trim())) {
+        elements.push(h("hr", { key: key(), className: "art-md-hr" }));
+        i++; continue;
+      }
+      // 빈 줄
+      if (line.trim() === "") { i++; continue; }
+      // 단락
+      elements.push(h("p", { key: key(), className: "art-md-p" }, parseInline(line)));
+      i++;
+    }
+    return elements;
+  }
+
+  // ── B2b: ImageRenderer (png/jpg/gif/webp + svg via makeSvgImgUrl) ──────────
+
+  function ImageRenderer(props) {
+    var item    = props.item;
+    var items   = props.items || [];
+    var onSelect = props.onSelect;
+    var isSvg  = props.isSvg;
+
+    var mountedRef = useRef(true);
+    var _url  = useState(null);  var blobUrl = _url[0];  var setBlobUrl = _url[1];
+    var _err  = useState(false); var loadErr = _err[0];  var setLoadErr = _err[1];
+    var _zoom = useState(false); var zoomed  = _zoom[0]; var setZoomed  = _zoom[1];
+
+    // 이미지/SVG 항목만 ←/→ 이동 대상
+    var navItems = useMemo(function () {
+      return items.filter(function (it) {
+        var p = classifyPreview(it);
+        return p === "image" || p === "svg";
+      });
+    }, [items]);
+    var curIdx = useMemo(function () {
+      return navItems.findIndex(function (it) { return it.id === item.id; });
+    }, [navItems, item.id]);
+
+    useEffect(function () {
+      mountedRef.current = true;
+      setBlobUrl(null); setLoadErr(false); setZoomed(false);
+      var localUrl = null;
+      fetchContent(item, false,
+        function (blob) {
+          if (!mountedRef.current) return;
+          // SVG는 makeSvgImgUrl로 격리: image/svg+xml Blob → <img> 전용
+          localUrl = isSvg ? makeSvgImgUrl(blob) : URL.createObjectURL(blob);
+          setBlobUrl(localUrl);
+        },
+        function () { if (mountedRef.current) setLoadErr(true); }
+      );
+      return function () {
+        mountedRef.current = false;
+        if (localUrl) URL.revokeObjectURL(localUrl);
+      };
+    }, [item.id, isSvg]);
+
+    function goPrev() { if (curIdx > 0 && onSelect) onSelect(navItems[curIdx - 1]); }
+    function goNext() { if (curIdx < navItems.length - 1 && onSelect) onSelect(navItems[curIdx + 1]); }
+
+    if (loadErr) return h("div", { className: "art-preview-err" },
+      h("span", { style: { fontSize: "28px", opacity: 0.3 } }, "⚠"),
+      h("p", null, "이미지를 불러올 수 없습니다")
+    );
+
+    return h("div", { className: "art-img-viewer" },
+      curIdx > 0 && h("button", {
+        className: "art-img-nav-btn art-img-nav-prev",
+        onClick: goPrev, "aria-label": "이전 이미지",
+      }, "‹"),
+      curIdx < navItems.length - 1 && h("button", {
+        className: "art-img-nav-btn art-img-nav-next",
+        onClick: goNext, "aria-label": "다음 이미지",
+      }, "›"),
+      !blobUrl
+        ? h("div", { className: "art-img-loading" },
+            h("div", { className: "art-skeleton", style: { width: "80px", height: "80px", borderRadius: "8px" } })
+          )
+        : h("img", {
+            className: "art-preview-img" + (zoomed ? " zoomed" : ""),
+            src: blobUrl,
+            alt: item.name,
+            onClick: function () { setZoomed(function (z) { return !z; }); },
+            title: zoomed ? "클릭하여 축소" : "클릭하여 확대",
+          })
+    );
+  }
+
+  // ── B2b: MdRenderer ────────────────────────────────────────────────────────
+
+  function MdRenderer(props) {
+    var item = props.item;
+    var mountedRef = useRef(true);
+    var _txt = useState(null);  var text    = _txt[0]; var setText    = _txt[1];
+    var _err = useState(false); var loadErr = _err[0]; var setLoadErr = _err[1];
+
+    useEffect(function () {
+      mountedRef.current = true;
+      setText(null); setLoadErr(false);
+      fetchContent(item, true,
+        function (t) { if (mountedRef.current) setText(t); },
+        function () { if (mountedRef.current) setLoadErr(true); }
+      );
+      return function () { mountedRef.current = false; };
+    }, [item.id]);
+
+    if (loadErr) return h("div", { className: "art-preview-err" }, "마크다운을 불러올 수 없습니다");
+    if (text === null) return h("div", { className: "art-text-loading" }, "불러오는 중…");
+    return h("div", { className: "art-md-content" }, parseMd(text));
+  }
+
+  // ── B2b: TextRenderer ──────────────────────────────────────────────────────
+  // txt/csv/log/json/yaml 등: <pre>에 raw text — React textContent → XSS 안전
+
+  function TextRenderer(props) {
+    var item = props.item;
+    var mountedRef = useRef(true);
+    var _txt = useState(null);  var text    = _txt[0]; var setText    = _txt[1];
+    var _err = useState(false); var loadErr = _err[0]; var setLoadErr = _err[1];
+
+    useEffect(function () {
+      mountedRef.current = true;
+      setText(null); setLoadErr(false);
+      fetchContent(item, true,
+        function (t) { if (mountedRef.current) setText(t); },
+        function () { if (mountedRef.current) setLoadErr(true); }
+      );
+      return function () { mountedRef.current = false; };
+    }, [item.id]);
+
+    if (loadErr) return h("div", { className: "art-preview-err" }, "파일을 불러올 수 없습니다");
+    if (text === null) return h("div", { className: "art-text-loading" }, "불러오는 중…");
+    return h("pre", { className: "art-text-content" }, text);
+  }
+
+  // ── B2b: PdfRenderer ───────────────────────────────────────────────────────
+
+  function PdfRenderer(props) {
+    var item = props.item;
+    var mountedRef = useRef(true);
+    var _url  = useState(null);  var blobUrl = _url[0];  var setBlobUrl = _url[1];
+    var _err  = useState(false); var loadErr = _err[0];  var setLoadErr = _err[1];
+
+    useEffect(function () {
+      mountedRef.current = true;
+      setBlobUrl(null); setLoadErr(false);
+      var localUrl = null;
+      fetchContent(item, false,
+        function (blob) {
+          if (!mountedRef.current) return;
+          localUrl = URL.createObjectURL(new Blob([blob], { type: "application/pdf" }));
+          setBlobUrl(localUrl);
+        },
+        function () { if (mountedRef.current) setLoadErr(true); }
+      );
+      return function () {
+        mountedRef.current = false;
+        if (localUrl) URL.revokeObjectURL(localUrl);
+      };
+    }, [item.id]);
+
+    if (loadErr) return h("div", { className: "art-preview-err" }, "PDF를 불러올 수 없습니다");
+    if (!blobUrl) return h("div", { className: "art-text-loading" }, "PDF 불러오는 중…");
+    return h("iframe", {
+      className: "art-pdf-frame",
+      src: blobUrl,
+      title: item.name,
+      // allow-scripts: 브라우저 내장 PDF 뷰어 플러그인에 필요.
+      // blob: origin이므로 외부 스크립트 접근 불가.
+      sandbox: "allow-scripts allow-same-origin",
+    });
+  }
+
+  // ── B2b: NoPreviewRenderer (html/htm 및 그 외) ─────────────────────────────
+
+  function NoPreviewRenderer(props) {
+    var item       = props.item;
+    var onDownload = props.onDownload;
+    return h("div", { className: "art-no-preview" },
+      h("span", { className: "art-no-preview-icon" }, "📄"),
+      h("p",    { className: "art-no-preview-text" }, "미리보기 불가 · 다운로드 전용"),
+      h("p",    { className: "art-no-preview-sub"  }, item.name),
+      h("button", {
+        className: "art-download-btn",
+        style: { marginTop: "8px" },
+        disabled: !!item.orphan,
+        onClick: function () { onDownload(item.id, item.name); },
+      }, "↓ 다운로드")
+    );
+  }
+
   // ── PreviewPane component ──────────────────────────────────────────────────
   //
   // B2a: meta header only.
@@ -579,14 +891,14 @@
           h("p", null, compareItems.length + "개 선택 — 비교뷰는 B2c에서 구현됩니다")
         );
       }
-      // Single item — B2b renders actual content here.
-      return h("div", { className: "art-preview-b2b-placeholder" },
-        h("span", { style: { fontSize: "40px", opacity: 0.2 } }, kindEmoji(selectedItem.kind)),
-        h("p", { style: { fontSize: "13px", marginTop: "8px" } }, selectedItem.name),
-        h("p", { style: { fontSize: "11px", color: "var(--art-fg-muted)", marginTop: "4px" } },
-          "미리보기 구현 중 (B2b)"
-        )
-      );
+      // B2b: 실제 컨텐츠 렌더러 (classifyPreview로 라우팅)
+      var preview = classifyPreview(selectedItem);
+      if (preview === "image") return h(ImageRenderer, { item: selectedItem, items: props.items, onSelect: props.onSelectItem, isSvg: false });
+      if (preview === "svg")   return h(ImageRenderer, { item: selectedItem, items: props.items, onSelect: props.onSelectItem, isSvg: true });
+      if (preview === "md")    return h(MdRenderer,    { item: selectedItem });
+      if (preview === "text")  return h(TextRenderer,  { item: selectedItem });
+      if (preview === "pdf")   return h(PdfRenderer,   { item: selectedItem });
+      return h(NoPreviewRenderer, { item: selectedItem, onDownload: onDownload });
     }
 
     return h("div", { className: cls, role: "region", "aria-label": "파일 미리보기" },
@@ -951,6 +1263,9 @@
           onMobileBack: function () { setMobilePreview(false); },
           onDownload: handleDownload,
           isMobileVisible: mobilePreview,
+          // B2b: 이미지 ←/→ 네비게이션용
+          items: items,
+          onSelectItem: handleSelect,
         })
       ),
       // Compare strip (≥2 selected)
