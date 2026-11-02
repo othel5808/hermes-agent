@@ -1,0 +1,14 @@
+{
+  "name": "artifacts",
+  "label": "Artifacts",
+  "description": "Browse, preview, and compare images, documents, and kanban attachments",
+  "icon": "Image",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/artifacts",
+    "position": "before:files"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
