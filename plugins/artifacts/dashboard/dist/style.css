@@ -853,3 +853,101 @@
   padding: 32px;
   text-align: center;
 }
+
+/* ── B2c: Compare grid ──────────────────────────────────────────────────────── */
+.art-compare-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-auto-rows: 1fr;
+  gap: 3px;
+  padding: 6px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--art-fg) 5%, var(--art-bg));
+  min-height: 0;
+}
+.art-compare-cell {
+  display: flex;
+  flex-direction: column;
+  background: var(--art-bg);
+  border-radius: var(--art-r-sm);
+  overflow: hidden;
+  border: 1px solid var(--art-border);
+  min-height: 0;
+}
+.art-compare-cell-head {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--art-border);
+  background: var(--art-card);
+  min-height: 26px;
+}
+.art-compare-cell-name {
+  flex: 1;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--art-fg-secondary);
+  font-weight: 500;
+}
+.art-compare-cell-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+.art-compare-mini-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.art-compare-cell-loading {
+  width: 70%;
+  height: 70%;
+  border-radius: var(--art-r-md);
+}
+.art-compare-cell-noimg {
+  font-size: 20px;
+  opacity: 0.35;
+}
+.art-compare-cell-nopreview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+}
+
+/* ── B2c: Mobile compare view button ────────────────────────────────────────── */
+.art-compare-view-btn {
+  display: none; /* desktop: hidden */
+}
+@media (max-width: 430px) {
+  .art-compare-view-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--art-info);
+    cursor: pointer;
+    padding: 4px 10px;
+    border-radius: var(--art-r-sm);
+    border: 1px solid color-mix(in srgb, var(--art-info) 30%, transparent);
+    background: color-mix(in srgb, var(--art-info) 8%, var(--art-bg));
+    transition: background 0.1s;
+    font-family: var(--art-font-sans);
+    white-space: nowrap;
+  }
+  .art-compare-view-btn:hover {
+    background: color-mix(in srgb, var(--art-info) 15%, var(--art-bg));
+  }
+}

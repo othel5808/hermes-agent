@@ -830,10 +830,87 @@
     );
   }
 
+  // ── B2c: CompareMiniImage ──────────────────────────────────────────────────
+  // 비교 grid 셀용 경량 이미지 로더.  blob revoke = unmount 시 자동.
+
+  function CompareMiniImage(props) {
+    var item   = props.item;
+    var isSvg  = props.isSvg;
+
+    var mountedRef = useRef(true);
+    var _url = useState(null);  var blobUrl = _url[0];  var setBlobUrl = _url[1];
+    var _err = useState(false); var loadErr = _err[0];  var setLoadErr = _err[1];
+
+    useEffect(function () {
+      mountedRef.current = true;
+      setBlobUrl(null); setLoadErr(false);
+      var localUrl = null;
+      fetchContent(item, false,
+        function (blob) {
+          if (!mountedRef.current) return;
+          localUrl = isSvg ? makeSvgImgUrl(blob) : URL.createObjectURL(blob);
+          setBlobUrl(localUrl);
+        },
+        function () { if (mountedRef.current) setLoadErr(true); }
+      );
+      return function () {
+        mountedRef.current = false;
+        if (localUrl) URL.revokeObjectURL(localUrl);
+      };
+    }, [item.id, isSvg]);
+
+    if (loadErr) return h("div", { className: "art-compare-cell-noimg" }, "⚠");
+    if (!blobUrl) return h("div", {
+      className: "art-compare-cell-loading art-skeleton",
+      style: { width: "70%", height: "70%", borderRadius: "6px" },
+    });
+    return h("img", {
+      className: "art-compare-mini-img",
+      src: blobUrl,
+      alt: item.name,
+    });
+  }
+
+  // ── B2c: CompareGrid ───────────────────────────────────────────────────────
+  // 2~4개 선택 시 미리보기 pane을 2-column grid로 전환.
+  // 이미지/SVG: CompareMiniImage.  그 외: 종류 아이콘+파일명.
+
+  function CompareGrid(props) {
+    var compareItems = props.compareItems; // 2..4 items
+
+    return h("div", { className: "art-compare-grid" },
+      compareItems.map(function (item) {
+        var preview = classifyPreview(item);
+        var isImg   = preview === "image" || preview === "svg";
+        return h("div", { key: item.id, className: "art-compare-cell" },
+          h("div", { className: "art-compare-cell-head" },
+            h("span", { className: srcDotClass(item.source) }),
+            h("span", { className: "art-compare-cell-name", title: item.name }, item.name)
+          ),
+          h("div", { className: "art-compare-cell-body" },
+            isImg
+              ? h(CompareMiniImage, { item: item, isSvg: preview === "svg" })
+              : h("div", { className: "art-compare-cell-nopreview" },
+                  h("span", { style: { fontSize: "28px", opacity: 0.25 } }, kindEmoji(item.kind)),
+                  h("p", {
+                    style: {
+                      fontSize: "10px", color: "var(--art-fg-muted)",
+                      textAlign: "center", padding: "0 10px",
+                      wordBreak: "break-all", marginTop: "6px",
+                    },
+                  }, item.name)
+                )
+          )
+        );
+      })
+    );
+  }
+
   // ── PreviewPane component ──────────────────────────────────────────────────
   //
   // B2a: meta header only.
   // B2b: replace the placeholder in preview-body with actual renderers.
+  // B2c: compare grid (2~4 items selected).
 
   function PreviewPane(props) {
     var selectedItem  = props.selectedItem;
@@ -848,6 +925,20 @@
     var cls = "art-preview-pane" + (isMobileVisible ? " mobile-visible" : "");
 
     function Header() {
+      // B2c: compare mode header — show back button + count title on all viewports.
+      // .art-mobile-back-btn is display:none on desktop so it stays invisible there.
+      if (isComparing) {
+        return h("div", { className: "art-preview-header" },
+          h("button", {
+            className: "art-mobile-back-btn",
+            onClick: onMobileBack,
+            "aria-label": "목록으로 돌아가기",
+          }, "← 목록"),
+          h("span", { className: "art-preview-filename" },
+            "⊞ " + compareItems.length + "개 비교"
+          )
+        );
+      }
       if (isEmpty) return null;
       return h("div", { className: "art-preview-header" },
         h("button", {
@@ -868,10 +959,12 @@
             "aria-label": "칸반 카드로 이동",
             onClick: function (e) {
               e.preventDefault();
+              // B2c: kanban deeplink — set both task ID and board slug before navigating.
+              // kanban plugin reads hermes.kanban.selectedTask + hermes.kanban.selectedBoard.
               try {
                 localStorage.setItem("hermes.kanban.selectedTask", selectedItem.task.id);
+                localStorage.setItem("hermes.kanban.selectedBoard", selectedItem.task.board || "default");
               } catch (_) {}
-              // Navigate to kanban tab — set hash to trigger SPA routing
               window.location.hash = "/kanban";
             },
           }, "🔗 ", selectedItem.task.id)
@@ -885,16 +978,14 @@
     }
 
     function Body() {
+      if (isComparing) {
+        // B2c: compare grid (2~4 items) — takes precedence over single-item preview.
+        return h(CompareGrid, { compareItems: compareItems });
+      }
       if (isEmpty) {
         return h("div", { className: "art-empty-preview" },
           h("span", { className: "art-empty-icon" }, "👈"),
           h("p", null, "왼쪽 목록에서 파일을 선택하세요")
-        );
-      }
-      if (isComparing) {
-        return h("div", { className: "art-compare-placeholder" },
-          h("span", { style: { fontSize: "32px", opacity: 0.4 } }, "⊞"),
-          h("p", null, compareItems.length + "개 선택 — 비교뷰는 B2c에서 구현됩니다")
         );
       }
       // B2b: 실제 컨텐츠 렌더러 (classifyPreview로 라우팅)
@@ -919,6 +1010,7 @@
     var compareItems = props.compareItems;
     var onRemove     = props.onRemove;
     var onClear      = props.onClear;
+    var onViewCompare = props.onViewCompare; // B2c: mobile "⊞ 비교" button
 
     if (!compareItems || compareItems.length < 2) return null;
 
@@ -942,6 +1034,12 @@
         );
       }),
       h("div", { className: "art-spacer" }),
+      // B2c: mobile-only button — hidden on desktop via CSS
+      h("button", {
+        className: "art-compare-view-btn",
+        onClick: onViewCompare,
+        "aria-label": "비교 그리드 보기",
+      }, "⊞ 비교"),
       h("button", { className: "art-clear-compare-btn", onClick: onClear }, "전체 해제")
     );
   }
@@ -1279,6 +1377,7 @@
         compareItems: compareItems,
         onRemove: handleRemoveCompare,
         onClear: handleClearCompare,
+        onViewCompare: function () { setMobilePreview(true); }, // B2c: mobile
       }),
       // Items error bar
       itemsError && h("div", { className: "art-items-error" },
