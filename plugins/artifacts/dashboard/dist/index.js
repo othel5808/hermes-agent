@@ -131,8 +131,11 @@
         .then(onSuccess)
         .catch(function (err) {
           if (err.status !== 404 || retry) { onError(err); return; }
-          refetchItem(item).then(function (refreshed) {
-            if (!refreshed || refreshed.id === item.id) { onError(err); return; }
+          // kind 필터 전달: 루트 간 동일 rel_path 오선택 방지.
+          // _make_id sha256 결정적 ID → 서버 재시작 후에도 동일 ID 반환.
+          // ID 동일 여부 무관하게 목록 재조회 성공 시 content 1회 재시도.
+          refetchItem(item, { kind: item.kind }).then(function (refreshed) {
+            if (!refreshed) { onError(err); return; }
             tryFetch(refreshed.id, true);
           }).catch(function () { onError(err); });
         });
@@ -174,9 +177,10 @@
     });
   }
 
-  // Requery an item by rel_path (for 404 cache-miss recovery; used by B2b).
-  // Searches the current filters to find the refreshed item with the same
-  // rel_path, then returns it (caller can retry /content/<new_id>).
+  // Requery an item by name+group (for 404 cache-miss recovery; used by B2b).
+  // API 응답에 rel_path 가 없으므로 name + group 조합으로 항목을 식별한다.
+  // 같은 group 내에 동일한 name 이 두 개 존재할 수 없으므로 안전하다.
+  // 서버 재시작 후 스캔 → 캐시 복구 → content 재요청까지 처리한다.
   // Exposed on window.__HERMES_ARTIFACTS__ for the B2b content renderer.
   function refetchItem(item, params) {
     var p = params || {};
@@ -189,8 +193,9 @@
     return apiFetch("/items?" + qs.toString()).then(function (r) {
       if (!r.ok) return null;
       return r.json().then(function (data) {
+        // name + group 으로 식별: rel_path 는 API 응답에 없으므로 사용 불가.
         return (data.items || []).find(function (i) {
-          return i.rel_path === item.rel_path;
+          return i.name === item.name && i.group === item.group;
         }) || null;
       });
     }).catch(function () { return null; });
@@ -259,10 +264,11 @@
           // 404: 1회 재조회 — 서버 재시작 후 stale id 복구.
           // 그 외 오류: 즉시 실패.
           if (err.status !== 404) { setFailed(true); return; }
-          refetchItem(item).then(function (refreshed) {
+          // kind 필터 전달: 루트 간 동일 rel_path 오선택 방지.
+          // ID 동일 여부 무관하게 목록 재조회 성공 시 content 1회 재시도.
+          refetchItem(item, { kind: item.kind }).then(function (refreshed) {
             if (!mountedRef.current) return;
-            // rel_path가 같은 새 항목을 못 찾거나 id가 동일하면 포기
-            if (!refreshed || refreshed.id === item.id) { setFailed(true); return; }
+            if (!refreshed) { setFailed(true); return; }
             return apiFetch("/content/" + refreshed.id)
               .then(function (r2) {
                 if (!r2.ok || !mountedRef.current) { setFailed(true); return; }
