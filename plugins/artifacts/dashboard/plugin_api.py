@@ -22,12 +22,14 @@ For every ``GET /content/{id}`` request the handler:
   1. Resolves id → (root_key, board, root, relpath) from the process-local
      TTL cache (populated during /items scans).
   2. ``lstat`` the target — records (st_dev, st_ino).
-  3. ``resolve().relative_to(root)`` — detects symlink escape via full
-     path resolution.
-  4. ``os.open(path, O_RDONLY | O_NOFOLLOW)`` — refuses a symlink leaf.
-  5. ``fstat(fd)`` — compares (st_dev, st_ino) against step 2 (swap
+  3. ``_open_component_walk(root, relpath)`` — opens every path component
+     using ``openat`` + ``O_NOFOLLOW``, refusing symlinks at **any** level
+     (leaf or intermediate directory).  A TOCTOU race that replaces an
+     intermediate directory with a symlink after the containment check but
+     before open is caught by ELOOP on the swapped component.
+  4. ``fstat(fd)`` — compares (st_dev, st_ino) against step 2 (swap
      detection); mismatch → 403.
-  6. Streams via ``StreamingResponse`` on the verified fd.
+  5. Streams via ``StreamingResponse`` on the verified fd.
   ``FileResponse(path)`` is never used — it would re-open the path and
   lose the verified fd.
 
@@ -50,7 +52,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from hermes_constants import get_process_hermes_home
 
@@ -176,23 +178,115 @@ def _check_sensitive(path: Path) -> None:
 # Verified-FD content serving
 # ---------------------------------------------------------------------------
 
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)  # 0 is a no-op flag if not defined
 
-def _serve_fd(path: Path, root: Path) -> StreamingResponse:
-    """Open path with full verified-FD protocol and return a StreamingResponse.
 
-    Protocol (see module docstring for details):
-      1. lstat → record dev/ino, confirm S_ISREG.
-      2. resolve().relative_to(root) — symlink escape detection.
-      3. os.open with O_RDONLY|O_NOFOLLOW — refuse symlink at leaf.
-      4. fstat → compare dev/ino (swap detection).
-      5. _is_sensitive_path check.
-      6. Stream via os.fdopen / StreamingResponse.
+def _open_component_walk(
+    root: Path,
+    relpath: str,
+    *,
+    _pre_open_hook=None,
+) -> int:
+    """Walk each path component of relpath from root using openat + O_NOFOLLOW.
 
-    FileResponse(path) is intentionally NOT used.
+    Opens the root directory, then iterates over every component of relpath,
+    opening each one relative to the previous directory fd with O_NOFOLLOW.
+    This ensures that no symlink at ANY component (not just the leaf) can be
+    traversed — a TOCTOU race that replaces an intermediate directory with a
+    symlink after containment checks but before the kernel open will be caught
+    by ELOOP on the swapped component.
+
+    Parameters
+    ----------
+    root:
+        Trusted root directory (absolute).  Opened directly by path (trusted
+        from the process-local cache — no user-supplied data).
+    relpath:
+        Relative path within root (e.g. ``"sub/photo.png"``).
+    _pre_open_hook:
+        Optional ``(part: str, dir_fd: int) -> None`` callback injected by
+        tests to simulate a directory-symlink race just before a component is
+        opened.  Called with the component name and the current dir_fd.
+
+    Returns
+    -------
+    int
+        An open file descriptor for the leaf file.  The caller is responsible
+        for ``os.close()``-ing it.
+
+    Raises
+    ------
+    HTTPException
+        403 for any symlink, permission, or containment failure.
+        404 if the leaf file does not exist.
     """
-    # Step 0: containment check via normpath (no FS access, catches ../.. escapes)
+    parts = Path(relpath).parts
+    if not parts:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    cur_fd = -1
     try:
-        normalized = Path(os.path.normpath(root / path.relative_to(root)))
+        # Open root itself — it is a trusted path from the process-local cache.
+        try:
+            cur_fd = os.open(str(root), os.O_RDONLY)
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Not found") from exc
+
+        for i, part in enumerate(parts):
+            is_leaf = i == len(parts) - 1
+            # O_NOFOLLOW: fail with ELOOP if this component is a symlink.
+            # O_DIRECTORY: fail with ENOTDIR if a non-leaf component is not a
+            # directory (available on all supported platforms; no-op if absent).
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if not is_leaf:
+                flags |= _O_DIRECTORY
+
+            if _pre_open_hook is not None:
+                _pre_open_hook(part, cur_fd)
+
+            try:
+                new_fd = os.open(part, flags, dir_fd=cur_fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise HTTPException(status_code=404, detail="Not found")
+                # ELOOP  — symlink at this component.
+                # ENOTDIR — non-leaf was not a directory.
+                # EACCES  — permission denied.
+                raise HTTPException(status_code=403, detail="Forbidden") from exc
+
+            os.close(cur_fd)
+            cur_fd = new_fd
+
+        result_fd = cur_fd
+        cur_fd = -1  # transfer ownership to caller
+        return result_fd
+
+    finally:
+        if cur_fd != -1:
+            os.close(cur_fd)
+
+
+def _serve_fd(root: Path, relpath: str) -> StreamingResponse:
+    """Serve root/relpath using the verified-FD protocol.
+
+    Protocol:
+      1. normpath containment check (no FS access, catches ../.. escapes).
+      2. lstat the target — record dev/ino, confirm S_ISREG.
+      3. _open_component_walk — opens every path component with O_NOFOLLOW,
+         refusing symlinks at any level (leaf or intermediate directory).
+      4. fstat on the verified fd — compare dev/ino (swap detection).
+      5. Confirm S_ISREG and size ≤ 100 MB.
+      6. _is_sensitive_path guard.
+      7. Stream via os.fdopen / StreamingResponse.
+
+    ``FileResponse(path)`` is intentionally NOT used — it re-opens the path
+    and loses the verified fd.
+    """
+    path = root / relpath
+
+    # Step 1: normpath containment check (no FS access — catches ../.. escapes)
+    try:
+        normalized = Path(os.path.normpath(path))
     except ValueError:
         raise HTTPException(status_code=403, detail="Forbidden")
     try:
@@ -200,7 +294,7 @@ def _serve_fd(path: Path, root: Path) -> StreamingResponse:
     except ValueError:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # Step 1: lstat (follows no symlinks itself — we want the leaf info)
+    # Step 2: lstat — record dev/ino, confirm S_ISREG
     try:
         pre_stat = os.lstat(path)
     except OSError as exc:
@@ -213,23 +307,11 @@ def _serve_fd(path: Path, root: Path) -> StreamingResponse:
 
     pre_dev, pre_ino = pre_stat.st_dev, pre_stat.st_ino
 
-    # Step 2: resolve full path — detects intermediate symlinks too
-    try:
-        resolved = path.resolve()
-        resolved.relative_to(root.resolve())
-    except (ValueError, OSError):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    # Step 3: open with O_NOFOLLOW to refuse a symlink at the final component
-    try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOENT, errno.ENOTDIR):
-            raise HTTPException(status_code=403, detail="Forbidden")
-        raise HTTPException(status_code=403, detail="Forbidden") from exc
+    # Step 3: open via component walk — O_NOFOLLOW at every component
+    fd = _open_component_walk(root, relpath)
 
     try:
-        # Step 4: fstat and compare dev/ino (TOCTOU / swap detection)
+        # Step 4: fstat → compare dev/ino (swap detection)
         post_stat = os.fstat(fd)
         if (post_stat.st_dev, post_stat.st_ino) != (pre_dev, pre_ino):
             log.warning("Artifacts: inode mismatch for %s — rejecting (possible swap)", path)
@@ -238,13 +320,14 @@ def _serve_fd(path: Path, root: Path) -> StreamingResponse:
         if not stat.S_ISREG(post_stat.st_mode):
             raise HTTPException(status_code=403, detail="Forbidden")
 
+        # Step 5: size guard
         if post_stat.st_size > _CONTENT_SIZE_LIMIT:
             raise HTTPException(status_code=413, detail="File too large")
 
-        # Step 5: sensitive-path check
+        # Step 6: sensitive-path check
         _check_sensitive(path)
 
-        # Step 6: stream on the verified fd
+        # Step 7: stream on the verified fd
         content_type, disposition_type = _mime_and_disposition(path.name)
         file_size = post_stat.st_size
 
@@ -466,7 +549,9 @@ def get_projects() -> dict:
     for root_key, (_, board, root) in roots.items():
         if not root.exists():
             continue
-        items, _, _ = _scan_root(root_key, board, root, topic_map, max_items=2000)
+        items, _, collision_errors = _scan_root(root_key, board, root, topic_map, max_items=2000)
+        if collision_errors:
+            raise HTTPException(status_code=500, detail="ID collision detected during scan")
         for item in items:
             proj = item["project"]
             if proj == "_unassigned":
@@ -587,12 +672,21 @@ def get_items(
 
 @router.get("/content/{item_id}")
 def get_content(item_id: str) -> StreamingResponse:
-    """Serve a file by its opaque id using the verified-FD protocol."""
-    entry = _cache_get(item_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="Not found or cache expired")
+    """Serve a file by its opaque id using the verified-FD protocol.
 
-    root_key, board, root, relpath = entry
-    path = root / relpath
+    All responses from this route include ``X-Content-Type-Options: nosniff``
+    — both the 200 StreamingResponse and any error JSONResponse.
+    """
+    try:
+        entry = _cache_get(item_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Not found or cache expired")
 
-    return _serve_fd(path, root)
+        root_key, board, root, relpath = entry
+        return _serve_fd(root, relpath)
+    except HTTPException as exc:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers={"X-Content-Type-Options": "nosniff"},
+        )

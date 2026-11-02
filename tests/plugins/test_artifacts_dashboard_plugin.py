@@ -224,29 +224,31 @@ def test_intermediate_directory_symlink_returns_403(api, tmp_path):
 # 5. 민감 파일 → 403
 # ---------------------------------------------------------------------------
 
-def test_sensitive_file_returns_403(api, monkeypatch):
-    """Files matched by _is_sensitive_path must be blocked even if reachable."""
+def test_sensitive_file_returns_403(api):
+    """Files matched by the real _is_sensitive_path guard must return 403.
+
+    This exercises the real web_server._is_sensitive_path function rather
+    than a stub — the .env denylist is authoritative from web_server.
+    """
     client, mod, home, staging, reports, briefs = api
 
-    # Write a .env file inside staging
+    # Verify the real guard is importable (test would be vacuous without it).
+    try:
+        from hermes_cli.web_server import _is_sensitive_path
+    except ImportError:
+        pytest.skip("web_server unavailable — sensitive guard not testable")
+
+    # Write a .env file inside staging.
     env_file = staging / ".env"
     env_file.write_text("SECRET_KEY=hunter2\n")
 
+    # Confirm the real guard considers this file sensitive.
+    assert _is_sensitive_path(env_file), (
+        "_is_sensitive_path must return True for .env; check web_server denylist"
+    )
+
     item_id = mod._make_id("staging", "", ".env")
     mod._cache_put(item_id, "staging", "", staging, ".env")
-
-    # Patch _check_sensitive to use the real _is_sensitive_path logic.
-    # If web_server is unavailable we simulate it with a stub that matches .env.
-    original_check = mod._check_sensitive
-
-    from fastapi import HTTPException as _HTTPException
-
-    def _stub_check(path):
-        if path.name.startswith(".env") or path.name.endswith(".env"):
-            raise _HTTPException(status_code=403, detail="Forbidden")
-        return original_check(path)
-
-    monkeypatch.setattr(mod, "_check_sensitive", _stub_check)
 
     r = client.get(f"/api/plugins/artifacts/content/{item_id}")
     assert r.status_code == 403, r.text
@@ -433,3 +435,197 @@ def test_items_invalid_cursor_returns_422(api):
     client, mod, home, staging, reports, briefs = api
     r = client.get("/api/plugins/artifacts/items", params={"cursor": "not-valid-base64-garbage!!!"})
     assert r.status_code == 422, r.text
+
+
+# ---------------------------------------------------------------------------
+# 11. openat 중간 디렉터리 심링크 race → 403
+# ---------------------------------------------------------------------------
+
+def test_intermediate_dir_symlink_race_returns_403(api, monkeypatch, tmp_path):
+    """openat walk catches a symlink race on an intermediate directory.
+
+    Demonstrates that _open_component_walk()'s per-component O_NOFOLLOW walk
+    catches a TOCTOU attack where:
+      1. Containment check (normpath) passes while staging/racetest is a real dir.
+      2. Between os.open(root) and the first component open, the adversary swaps
+         staging/racetest with a symlink pointing outside staging.
+      3. os.open("racetest", O_RDONLY|O_NOFOLLOW|O_DIRECTORY, dir_fd=root_fd)
+         sees the symlink and fails with ELOOP → 403.
+
+    The old path-based resolve()+open() approach would miss this race:
+    resolve() can succeed before the swap, but open() would follow the now-
+    symlinked path after it.
+    """
+    client, mod, home, staging, reports, briefs = api
+
+    # Set up a real subdirectory with a file.
+    sub = staging / "racetest"
+    sub.mkdir()
+    target_file = sub / "photo.png"
+    target_file.write_bytes(b"\x89PNG\r\n\x1a\nDATA")
+
+    # Evil directory outside staging.
+    evil_dir = tmp_path / "evil"
+    evil_dir.mkdir()
+    (evil_dir / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\nEVIL")
+
+    item_id = mod._make_id("staging", "", "racetest/photo.png")
+    mod._cache_put(item_id, "staging", "", staging, "racetest/photo.png")
+
+    # Intercept os.open: after opening the root (staging) directory, atomically
+    # replace staging/racetest with a symlink to evil_dir.
+    real_os_open = os.open
+    _swapped = [False]
+
+    def _intercept_open(path_or_name, flags, mode=0o777, *, dir_fd=None):
+        result = real_os_open(path_or_name, flags, mode, dir_fd=dir_fd)
+        # Only trigger the swap once — after opening the root directory itself.
+        if not _swapped[0] and dir_fd is None and str(path_or_name) == str(staging):
+            # Empty then remove the real subdirectory, replace with a symlink.
+            target_file.unlink()
+            sub.rmdir()
+            sub.symlink_to(evil_dir)
+            _swapped[0] = True
+        return result
+
+    monkeypatch.setattr(os, "open", _intercept_open)
+
+    r = client.get(f"/api/plugins/artifacts/content/{item_id}")
+    # The symlink race must be caught — the response must be a security rejection.
+    assert r.status_code == 403, (
+        f"Expected 403 for intermediate-dir symlink race, got {r.status_code}: {r.text}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. TTL 만료 → 404
+# ---------------------------------------------------------------------------
+
+def test_cache_ttl_expiry_returns_404(api, monkeypatch):
+    """After the cache TTL expires the entry is evicted and content returns 404."""
+    client, mod, home, staging, reports, briefs = api
+
+    f = staging / "ttl_test.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\nDATA")
+
+    # Use an imperceptibly small TTL so the entry expires immediately.
+    monkeypatch.setattr(mod, "_CACHE_TTL", 0.0)
+
+    item_id = mod._make_id("staging", "", "ttl_test.png")
+    mod._cache_put(item_id, "staging", "", staging, "ttl_test.png")
+
+    # The TTL was 0 s — the entry is already expired.
+    r = client.get(f"/api/plugins/artifacts/content/{item_id}")
+    assert r.status_code == 404, r.text
+
+
+# ---------------------------------------------------------------------------
+# 13. .htm → attachment + nosniff
+# ---------------------------------------------------------------------------
+
+def test_htm_served_as_attachment_with_nosniff(api):
+    """.htm files must be served as application/octet-stream + attachment + nosniff."""
+    client, mod, home, staging, reports, briefs = api
+
+    item_id = _seed_and_cache(client, staging, "report.htm", b"<html>hi</html>")
+    r = client.get(f"/api/plugins/artifacts/content/{item_id}")
+    assert r.status_code == 200, r.text
+    assert "attachment" in r.headers.get("content-disposition", ""), r.headers
+    assert r.headers.get("content-type", "").startswith("application/octet-stream"), r.headers
+    assert r.headers.get("x-content-type-options") == "nosniff", r.headers
+
+
+# ---------------------------------------------------------------------------
+# 14. /projects id 충돌 → 500
+# ---------------------------------------------------------------------------
+
+def test_projects_id_collision_returns_500(api):
+    """ID collision during /projects scan must surface as 500.
+
+    Previously get_projects() discarded collision_errors from _scan_root().
+    This test confirms the fix: a collision now raises HTTPException(500) from
+    /projects just as it does from /items.
+    """
+    client, mod, home, staging, reports, briefs = api
+
+    relpath = "proj_collision.png"
+    collision_id = mod._make_id("staging", "", relpath)
+
+    # Pre-fill cache with a DIFFERENT tuple for the same id (fake collision).
+    (staging / relpath).write_bytes(b"\x89PNG\r\n\x1a\n")
+    mod._cache_put(collision_id, "staging", "", staging, "DIFFERENT.png")
+
+    original_make_id = mod._make_id
+
+    def _collision_id(rk, board, rp):
+        if rp == relpath and rk == "staging":
+            return collision_id
+        return original_make_id(rk, board, rp)
+
+    mod._make_id = _collision_id
+
+    r = client.get("/api/plugins/artifacts/projects")
+    assert r.status_code == 500, r.text
+
+
+# ---------------------------------------------------------------------------
+# 15. process-home override — behavioral: ContextVar override 무시
+# ---------------------------------------------------------------------------
+
+def test_process_hermes_home_ignores_contextvar_override(monkeypatch, tmp_path):
+    """plugin_api._get_roots() must use get_process_hermes_home(), not get_hermes_home().
+
+    get_hermes_home() follows a request-scoped ContextVar override (set_hermes_home_override).
+    get_process_hermes_home() ignores that override and always reads the HERMES_HOME env var.
+
+    The plugin must use get_process_hermes_home() so that its roots stay anchored to the
+    process-launch home even when a per-request profile override is active.
+    """
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    # Launch home — contains the file we'll serve.
+    launch_home = tmp_path / "launch"
+    (launch_home / "task-staging").mkdir(parents=True)
+    (launch_home / "reports").mkdir(parents=True)
+    (launch_home / "kanban" / "briefs").mkdir(parents=True)
+    f = launch_home / "task-staging" / "real.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\nRESULT")
+
+    # Request-scoped override — different home that does NOT contain the file.
+    req_home = tmp_path / "request"
+    (req_home / "task-staging").mkdir(parents=True)
+    (req_home / "reports").mkdir(parents=True)
+    (req_home / "kanban" / "briefs").mkdir(parents=True)
+
+    # Load plugin module with launch_home as HERMES_HOME.
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    mod = _load_plugin_api(monkeypatch, launch_home)
+
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/artifacts")
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # Populate the cache while launch_home is active.
+    r = client.get("/api/plugins/artifacts/items")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    item = next((i for i in items if i["name"] == "real.png"), None)
+    assert item is not None, "real.png must appear in /items scan under launch_home"
+    item_id = item["id"]
+
+    # Now set a request-scoped ContextVar override pointing to req_home.
+    # get_hermes_home() would follow this and serve from req_home (missing file → 404).
+    # get_process_hermes_home() ignores it and keeps serving from launch_home.
+    token = set_hermes_home_override(req_home)
+    try:
+        r2 = client.get(f"/api/plugins/artifacts/content/{item_id}")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert r2.status_code == 200, (
+        f"Expected 200 — plugin must use get_process_hermes_home() (launch_home={launch_home}), "
+        f"not get_hermes_home() which would follow req_home={req_home}. "
+        f"Got {r2.status_code}: {r2.text}"
+    )

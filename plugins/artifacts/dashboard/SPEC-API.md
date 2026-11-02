@@ -102,7 +102,10 @@ The id is opaque to the client; the client must never construct it.
 | .pdf                              | application/pdf                 | inline      |
 | .svg .html .htm **and all others**| application/octet-stream        | attachment  |
 
-Every response includes `X-Content-Type-Options: nosniff`.
+Every response from ``GET /content/{id}`` includes ``X-Content-Type-Options: nosniff`` —
+both the 200 ``StreamingResponse`` (file content) and any error ``JSONResponse``
+(403 / 404 / 413).  Responses from ``/projects`` and ``/items`` do not carry
+this header; they return JSON data, not file content.
 
 The DB `content_type` field on kanban attachments is **not trusted** —
 MIME is determined solely from the file extension.
@@ -115,13 +118,14 @@ For every `/content/{id}` request:
 
 1. Resolve `id` → `(root_key, board, root, relpath)` from process cache.
 2. `lstat(root / relpath)` — confirm `S_ISREG`, get `(st_dev, st_ino)`.
-3. `resolve().relative_to(root)` — confirm no symlink escape.
-4. `os.open(path, O_RDONLY | O_NOFOLLOW)` — refuse symlink at the leaf.
-5. `os.fstat(fd)` — confirm `(st_dev, st_ino)` matches step 2 (swap
+3. `_open_component_walk(root, relpath)` — opens each path component with
+   `openat(dir_fd, part, O_RDONLY | O_NOFOLLOW [| O_DIRECTORY])`.
+   Any symlink at any component (leaf or intermediate) → ELOOP → 403.
+4. `os.fstat(fd)` — confirm `(st_dev, st_ino)` matches step 2 (swap
    detection).  Mismatch → 403.
-6. Confirm `S_ISREG` and size ≤ 100 MB on the fd.
-7. `_is_sensitive_path(path)` guard.
-8. Wrap fd with `os.fdopen` and stream via `StreamingResponse`.
+5. Confirm `S_ISREG` and size ≤ 100 MB on the fd.
+6. `_is_sensitive_path(path)` guard.
+7. Wrap fd with `os.fdopen` and stream via `StreamingResponse`.
 
 `FileResponse(path)` is **never used** (it re-opens the path, losing the
 verified fd).
@@ -147,14 +151,14 @@ defence is that files must be reachable within one of the four roots.
 
 | Threat | Mitigation |
 |--------|-----------|
-| Path traversal (`../../../etc/passwd`) | `resolve().relative_to(root)` before open |
-| Symlink escape at leaf | `O_NOFOLLOW` on `os.open` → ELOOP → 403 |
+| Path traversal (`../../../etc/passwd`) | `normpath` containment check before any FS access |
+| Symlink escape at leaf | `O_NOFOLLOW` on every `os.open` call in `_open_component_walk` → ELOOP → 403 |
 | TOCTOU / file swap between check and read | `lstat` st_dev/st_ino checked against post-open `fstat` |
-| Intermediate directory symlink swap | full `resolve()` re-validates the whole path each request |
+| Intermediate directory symlink swap | `_open_component_walk` opens every component with `dir_fd` + `O_NOFOLLOW`; a swap between containment check and open is caught by ELOOP |
 | Sensitive file exfil (`.env`, tokens) | `_is_sensitive_path` guard on every serve |
 | XSS via SVG/HTML served inline | SVG/HTML/HTM → octet-stream + attachment |
 | Script injection via JS/unknown ext | octet-stream + attachment for every non-allowlist ext |
-| Content-type sniffing | `X-Content-Type-Options: nosniff` on every response |
+| Content-type sniffing | `X-Content-Type-Options: nosniff` on every response from GET /content/{id} (200 and errors) |
 | Opaque id reverse-engineering | id is a 24-hex SHA256 prefix; full path never in response |
 | ID hash collision | Collision between two tuples → scan returns 500 |
 | Unauthenticated access | Dashboard `auth_middleware` covers all `/api/plugins/…` routes |
