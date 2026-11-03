@@ -8,7 +8,7 @@
     "path": "/artifacts",
     "position": "before:files"
   },
-  "entry": "dist/index.js",
+  "entry": "dist/artifacts-loader.js",
   "css": "dist/style.css",
   "api": "plugin_api.py"
 }

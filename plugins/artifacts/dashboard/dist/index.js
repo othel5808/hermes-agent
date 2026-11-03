@@ -27,6 +27,8 @@
   // ── SDK guard ──────────────────────────────────────────────────────────────
   var SDK = window.__HERMES_PLUGIN_SDK__;
   if (!SDK) return;
+  var ArtifactsCore = window.ArtifactsCore;
+  if (!ArtifactsCore) return;
 
   var React      = SDK.React;
   var authedFetch = SDK.authedFetch;
@@ -68,12 +70,11 @@
   }
 
   function isDownloadOnly(item) {
-    // B2b: svg는 이제 <img>로 미리보기 가능 → 목록 썸네일 ↓only 배지 제거
-    var name = (item.name || "").toLowerCase();
-    return (
-      name.endsWith(".html") || name.endsWith(".htm") ||
-      item.kind === "other"
-    );
+    return ArtifactsCore.isDownloadOnly(item);
+  }
+
+  function badgeForItem(item) {
+    return ArtifactsCore.badgeForItem(item);
   }
 
   // ── B2b helpers ─────────────────────────────────────────────────────────────
@@ -85,20 +86,7 @@
 
   // classifyPreview — 확장자/kind 기반 렌더러 결정
   function classifyPreview(item) {
-    var name = (item.name || "").toLowerCase();
-    var ext  = getExt(name);
-    var imgExts = ["png","jpg","jpeg","gif","webp","bmp","tiff","avif"];
-    if (imgExts.indexOf(ext) !== -1 || item.kind === "image") return "image";
-    if (ext === "svg")                          return "svg";
-    if (ext === "md" || ext === "markdown")     return "md";
-    var textExts = [
-      "txt","csv","log","json","yaml","yml","xml","ini","toml","conf",
-      "sh","bash","py","js","ts","tsx","jsx","mjs","cjs",
-      "rb","go","rs","c","cpp","h","java","kt","swift"
-    ];
-    if (textExts.indexOf(ext) !== -1)           return "text";
-    if (ext === "pdf")                          return "pdf";
-    return "no-preview"; // html/htm 및 그 외
+    return ArtifactsCore.previewKind(item);
   }
 
   /**
@@ -120,24 +108,24 @@
 
   // fetchContent — authedFetch + 404 1회 refetch 공통 패턴
   // onSuccess(responseOrText), onError(err), asText=true 면 r.text() 반환
-  function fetchContent(item, asText, onSuccess, onError) {
-    var localUrl = null; // caller uses only for blob; text path ignores
+  function fetchContent(item, asText, onSuccess, onError, signal) {
     function tryFetch(id, retry) {
-      apiFetch("/content/" + id)
+      apiFetch("/content/" + id, signal ? { signal: signal } : undefined)
         .then(function (r) {
           if (!r.ok) throw Object.assign(new Error(r.status), { status: r.status });
           return asText ? r.text() : r.blob();
         })
         .then(onSuccess)
         .catch(function (err) {
+          if (signal && signal.aborted) return;
+          var retryState = { status: err.status, alreadyRetried: retry, originalItem: item, refreshedItem: null };
           if (err.status !== 404 || retry) { onError(err); return; }
-          // kind 필터 전달: 루트 간 동일 rel_path 오선택 방지.
-          // _make_id sha256 결정적 ID → 서버 재시작 후에도 동일 ID 반환.
-          // ID 동일 여부 무관하게 목록 재조회 성공 시 content 1회 재시도.
           refetchItem(item, { kind: item.kind }).then(function (refreshed) {
-            if (!refreshed) { onError(err); return; }
+            if (signal && signal.aborted) return;
+            retryState.refreshedItem = refreshed;
+            if (!ArtifactsCore.shouldRetryContent(retryState)) { onError(err); return; }
             tryFetch(refreshed.id, true);
-          }).catch(function () { onError(err); });
+          }).catch(function () { if (!signal || !signal.aborted) onError(err); });
         });
     }
     tryFetch(item.id, false);
@@ -146,6 +134,7 @@
   // ── API layer ──────────────────────────────────────────────────────────────
 
   var API = "/api/plugins/artifacts";
+  var activeFilters = {};
 
   function apiFetch(path, opts) {
     return authedFetch(API + path, opts || {});
@@ -158,15 +147,8 @@
     });
   }
 
-  function fetchItems(params) {
-    var qs = new URLSearchParams();
-    if (params.project && params.project !== "all") qs.set("project", params.project);
-    if (params.source  && params.source  !== "all") qs.set("source",  params.source);
-    if (params.kind    && params.kind    !== "all") qs.set("kind",    params.kind);
-    if (params.q)       qs.set("q",      params.q.slice(0, 100));
-    if (params.cursor)  qs.set("cursor", params.cursor);
-    qs.set("limit", "50");
-    return apiFetch("/items?" + qs.toString()).then(function (r) {
+  function fetchItems(params, opts) {
+    return apiFetch("/items" + ArtifactsCore.buildItemsQuery(params), opts).then(function (r) {
       if (r.status === 422) {
         return r.json().catch(function () { return {}; }).then(function (body) {
           throw Object.assign(new Error("422"), { status: 422, body: body });
@@ -182,21 +164,12 @@
   // 같은 group 내에 동일한 name 이 두 개 존재할 수 없으므로 안전하다.
   // 서버 재시작 후 스캔 → 캐시 복구 → content 재요청까지 처리한다.
   // Exposed on window.__HERMES_ARTIFACTS__ for the B2b content renderer.
-  function refetchItem(item, params) {
-    var p = params || {};
-    var qs = new URLSearchParams();
-    if (p.project && p.project !== "all") qs.set("project", p.project);
-    if (p.source  && p.source  !== "all") qs.set("source",  p.source);
-    if (p.kind    && p.kind    !== "all") qs.set("kind",    p.kind);
-    if (item.name) qs.set("q", item.name.slice(0, 100));
-    qs.set("limit", "20");
-    return apiFetch("/items?" + qs.toString()).then(function (r) {
+  function refetchItem(item, filters) {
+    var requestFilters = Object.assign({}, activeFilters, filters || {});
+    return apiFetch("/items" + ArtifactsCore.buildRefetchQuery(item, requestFilters)).then(function (r) {
       if (!r.ok) return null;
       return r.json().then(function (data) {
-        // name + group 으로 식별: rel_path 는 API 응답에 없으므로 사용 불가.
-        return (data.items || []).find(function (i) {
-          return i.name === item.name && i.group === item.group;
-        }) || null;
+        return ArtifactsCore.selectRefetchedItem(data.items || [], item);
       });
     }).catch(function () { return null; });
   }
@@ -289,12 +262,13 @@
     }, [item.id, item.kind]);
 
     var dlOnly = isDownloadOnly(item);
+    var itemBadge = badgeForItem(item);
 
     return h("div", { className: "art-thumb" },
       (item.kind === "image" && blobUrl)
         ? h("img", { src: blobUrl, alt: item.name, loading: "lazy" })
         : h("span", { style: { fontSize: "16px" } }, kindEmoji(item.kind)),
-      dlOnly && h("span", { className: "art-dl-only" }, "↓ only")
+      itemBadge && h("span", { className: "art-dl-only" }, "↓ only")
     );
   }
 
@@ -661,7 +635,7 @@
     var onSelect = props.onSelect;
     var isSvg  = props.isSvg;
 
-    var mountedRef = useRef(true);
+    var blobRef = useRef(null);
     var _url  = useState(null);  var blobUrl = _url[0];  var setBlobUrl = _url[1];
     var _err  = useState(false); var loadErr = _err[0];  var setLoadErr = _err[1];
     var _zoom = useState(false); var zoomed  = _zoom[0]; var setZoomed  = _zoom[1];
@@ -670,7 +644,7 @@
     var navItems = useMemo(function () {
       return items.filter(function (it) {
         var p = classifyPreview(it);
-        return p === "image" || p === "svg";
+        return p === "image" || p === "svg-img";
       });
     }, [items]);
     var curIdx = useMemo(function () {
@@ -678,21 +652,23 @@
     }, [navItems, item.id]);
 
     useEffect(function () {
-      mountedRef.current = true;
       setBlobUrl(null); setLoadErr(false); setZoomed(false);
       var localUrl = null;
+      var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
       fetchContent(item, false,
         function (blob) {
-          if (!mountedRef.current) return;
+          if (ac && ac.signal.aborted) return;
           // SVG는 makeSvgImgUrl로 격리: image/svg+xml Blob → <img> 전용
           localUrl = isSvg ? makeSvgImgUrl(blob) : URL.createObjectURL(blob);
+          blobRef.current = localUrl;
           setBlobUrl(localUrl);
         },
-        function () { if (mountedRef.current) setLoadErr(true); }
+        function () { if (!ac || !ac.signal.aborted) setLoadErr(true); },
+        ac && ac.signal
       );
       return function () {
-        mountedRef.current = false;
-        if (localUrl) URL.revokeObjectURL(localUrl);
+        if (ac) ac.abort();
+        if (blobRef.current) { URL.revokeObjectURL(blobRef.current); blobRef.current = null; }
       };
     }, [item.id, isSvg]);
 
@@ -731,18 +707,18 @@
 
   function MdRenderer(props) {
     var item = props.item;
-    var mountedRef = useRef(true);
     var _txt = useState(null);  var text    = _txt[0]; var setText    = _txt[1];
     var _err = useState(false); var loadErr = _err[0]; var setLoadErr = _err[1];
 
     useEffect(function () {
-      mountedRef.current = true;
       setText(null); setLoadErr(false);
+      var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
       fetchContent(item, true,
-        function (t) { if (mountedRef.current) setText(t); },
-        function () { if (mountedRef.current) setLoadErr(true); }
+        function (t) { if (!ac || !ac.signal.aborted) setText(t); },
+        function () { if (!ac || !ac.signal.aborted) setLoadErr(true); },
+        ac && ac.signal
       );
-      return function () { mountedRef.current = false; };
+      return function () { if (ac) ac.abort(); };
     }, [item.id]);
 
     if (loadErr) return h("div", { className: "art-preview-err" }, "마크다운을 불러올 수 없습니다");
@@ -755,18 +731,18 @@
 
   function TextRenderer(props) {
     var item = props.item;
-    var mountedRef = useRef(true);
     var _txt = useState(null);  var text    = _txt[0]; var setText    = _txt[1];
     var _err = useState(false); var loadErr = _err[0]; var setLoadErr = _err[1];
 
     useEffect(function () {
-      mountedRef.current = true;
       setText(null); setLoadErr(false);
+      var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
       fetchContent(item, true,
-        function (t) { if (mountedRef.current) setText(t); },
-        function () { if (mountedRef.current) setLoadErr(true); }
+        function (t) { if (!ac || !ac.signal.aborted) setText(t); },
+        function () { if (!ac || !ac.signal.aborted) setLoadErr(true); },
+        ac && ac.signal
       );
-      return function () { mountedRef.current = false; };
+      return function () { if (ac) ac.abort(); };
     }, [item.id]);
 
     if (loadErr) return h("div", { className: "art-preview-err" }, "파일을 불러올 수 없습니다");
@@ -774,43 +750,7 @@
     return h("pre", { className: "art-text-content" }, text);
   }
 
-  // ── B2b: PdfRenderer ───────────────────────────────────────────────────────
-
-  function PdfRenderer(props) {
-    var item = props.item;
-    var mountedRef = useRef(true);
-    var _url  = useState(null);  var blobUrl = _url[0];  var setBlobUrl = _url[1];
-    var _err  = useState(false); var loadErr = _err[0];  var setLoadErr = _err[1];
-
-    useEffect(function () {
-      mountedRef.current = true;
-      setBlobUrl(null); setLoadErr(false);
-      var localUrl = null;
-      fetchContent(item, false,
-        function (blob) {
-          if (!mountedRef.current) return;
-          localUrl = URL.createObjectURL(new Blob([blob], { type: "application/pdf" }));
-          setBlobUrl(localUrl);
-        },
-        function () { if (mountedRef.current) setLoadErr(true); }
-      );
-      return function () {
-        mountedRef.current = false;
-        if (localUrl) URL.revokeObjectURL(localUrl);
-      };
-    }, [item.id]);
-
-    if (loadErr) return h("div", { className: "art-preview-err" }, "PDF를 불러올 수 없습니다");
-    if (!blobUrl) return h("div", { className: "art-text-loading" }, "PDF 불러오는 중…");
-    return h("iframe", {
-      className: "art-pdf-frame",
-      src: blobUrl,
-      title: item.name,
-      // allow-scripts: 브라우저 내장 PDF 뷰어 플러그인에 필요.
-      // blob: origin이므로 외부 스크립트 접근 불가.
-      sandbox: "allow-scripts allow-same-origin",
-    });
-  }
+  // ── Download-only renderers are intentionally routed to NoPreviewRenderer. ──
 
   // ── B2b: NoPreviewRenderer (html/htm 및 그 외) ─────────────────────────────
 
@@ -837,25 +777,26 @@
     var item   = props.item;
     var isSvg  = props.isSvg;
 
-    var mountedRef = useRef(true);
+    var blobRef = useRef(null);
     var _url = useState(null);  var blobUrl = _url[0];  var setBlobUrl = _url[1];
     var _err = useState(false); var loadErr = _err[0];  var setLoadErr = _err[1];
 
     useEffect(function () {
-      mountedRef.current = true;
       setBlobUrl(null); setLoadErr(false);
-      var localUrl = null;
+      var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
       fetchContent(item, false,
         function (blob) {
-          if (!mountedRef.current) return;
-          localUrl = isSvg ? makeSvgImgUrl(blob) : URL.createObjectURL(blob);
-          setBlobUrl(localUrl);
+          if (ac && ac.signal.aborted) return;
+          var url = isSvg ? makeSvgImgUrl(blob) : URL.createObjectURL(blob);
+          blobRef.current = url;
+          setBlobUrl(url);
         },
-        function () { if (mountedRef.current) setLoadErr(true); }
+        function () { if (!ac || !ac.signal.aborted) setLoadErr(true); },
+        ac && ac.signal
       );
       return function () {
-        mountedRef.current = false;
-        if (localUrl) URL.revokeObjectURL(localUrl);
+        if (ac) ac.abort();
+        if (blobRef.current) { URL.revokeObjectURL(blobRef.current); blobRef.current = null; }
       };
     }, [item.id, isSvg]);
 
@@ -881,7 +822,7 @@
     return h("div", { className: "art-compare-grid" },
       compareItems.map(function (item) {
         var preview = classifyPreview(item);
-        var isImg   = preview === "image" || preview === "svg";
+        var isImg   = preview === "image" || preview === "svg-img";
         return h("div", { key: item.id, className: "art-compare-cell" },
           h("div", { className: "art-compare-cell-head" },
             h("span", { className: srcDotClass(item.source) }),
@@ -889,7 +830,7 @@
           ),
           h("div", { className: "art-compare-cell-body" },
             isImg
-              ? h(CompareMiniImage, { item: item, isSvg: preview === "svg" })
+              ? h(CompareMiniImage, { item: item, isSvg: preview === "svg-img" })
               : h("div", { className: "art-compare-cell-nopreview" },
                   h("span", { style: { fontSize: "28px", opacity: 0.25 } }, kindEmoji(item.kind)),
                   h("p", {
@@ -991,10 +932,9 @@
       // B2b: 실제 컨텐츠 렌더러 (classifyPreview로 라우팅)
       var preview = classifyPreview(selectedItem);
       if (preview === "image") return h(ImageRenderer, { item: selectedItem, items: props.items, onSelect: props.onSelectItem, isSvg: false });
-      if (preview === "svg")   return h(ImageRenderer, { item: selectedItem, items: props.items, onSelect: props.onSelectItem, isSvg: true });
-      if (preview === "md")    return h(MdRenderer,    { item: selectedItem });
-      if (preview === "text")  return h(TextRenderer,  { item: selectedItem });
-      if (preview === "pdf")   return h(PdfRenderer,   { item: selectedItem });
+      if (preview === "svg-img") return h(ImageRenderer, { item: selectedItem, items: props.items, onSelect: props.onSelectItem, isSvg: true });
+      if (preview === "markdown") return h(MdRenderer, { item: selectedItem });
+      if (preview === "text") return h(TextRenderer, { item: selectedItem });
       return h(NoPreviewRenderer, { item: selectedItem, onDownload: onDownload });
     }
 
@@ -1080,6 +1020,7 @@
 
     var sentinelRef   = useRef(null);
     var abortCtrlRef  = useRef(null);
+    var cursorAcRef   = useRef(null);
     var loadingMoreRef = useRef(false);
     var nextCursorRef = useRef(null);
 
@@ -1108,6 +1049,11 @@
       if (abortCtrlRef.current) {
         try { abortCtrlRef.current.abort(); } catch (_) {}
       }
+      if (cursorAcRef.current) {
+        try { cursorAcRef.current.abort(); } catch (_) {}
+        cursorAcRef.current = null;
+      }
+      loadingMoreRef.current = false;
       var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
       abortCtrlRef.current = ac;
 
@@ -1118,7 +1064,7 @@
       setTruncated(false);
       setCount(null);
 
-      fetchItems(Object.assign({}, params, { cursor: "" }))
+      fetchItems(Object.assign({}, params, { cursor: "" }), ac ? { signal: ac.signal } : undefined)
         .then(function (data) {
           if (ac && ac.signal && ac.signal.aborted) return;
           setItems(data.items || []);
@@ -1147,6 +1093,10 @@
     loadItemsRef.current = loadItems;
 
     useEffect(function () {
+      activeFilters = { project: activeProject, source: source, kind: kind, q: q };
+    }, [activeProject, source, kind, q]);
+
+    useEffect(function () {
       loadItemsRef.current({ project: activeProject, source: source, kind: kind, q: q });
     }, [activeProject, source, kind, q]);
 
@@ -1158,6 +1108,9 @@
         if (!entries[0].isIntersecting) return;
         var cursor = nextCursorRef.current;
         if (!cursor || loadingMoreRef.current) return;
+        if (cursorAcRef.current) { try { cursorAcRef.current.abort(); } catch (_) {} }
+        var cursorAc = (typeof AbortController !== "undefined") ? new AbortController() : null;
+        cursorAcRef.current = cursorAc;
         loadingMoreRef.current = true;
         setLoadingMore(true);
         fetchItems({
@@ -1166,22 +1119,29 @@
           kind: kind,
           q: q,
           cursor: cursor,
-        }).then(function (data) {
+        }, cursorAc ? { signal: cursorAc.signal } : undefined).then(function (data) {
+          if (cursorAc && cursorAc.signal.aborted) return;
           setItems(function (prev) { return prev.concat(data.items || []); });
           setNextCursor(data.next_cursor || null);
           setTruncated(!!data.truncated);
           setCount(data.count != null ? data.count : null);
         }).catch(function (e) {
+          if (cursorAc && cursorAc.signal.aborted) return;
           if (e.status !== 422) showToast("추가 항목 로드 실패");
         }).then(function () {
           loadingMoreRef.current = false;
           setLoadingMore(false);
         });
-      }, { threshold: 0.1 });
+      }, { root: el.parentElement, threshold: 0.1 });
       observer.observe(el);
-      return function () { observer.disconnect(); };
-    }, [activeProject, source, kind, q]);
-    // NOTE: nextCursor & loadingMore are read from refs inside the observer.
+      return function () {
+        observer.disconnect();
+        if (cursorAcRef.current) { try { cursorAcRef.current.abort(); } catch (_) {} cursorAcRef.current = null; }
+        loadingMoreRef.current = false;
+      };
+    }, [activeProject, source, kind, q, nextCursor]);
+    // nextCursor is included so a sentinel initially visible during the loading
+    // state is observed again once the first page supplies its cursor.
 
     // ── Keyboard navigation in file list ────────────────────────────────────
     useEffect(function () {
